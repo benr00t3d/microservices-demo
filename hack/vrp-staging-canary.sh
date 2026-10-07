@@ -107,7 +107,7 @@ can_i() {
   local label="$1"
   shift
   local decision
-  decision="$(kubectl auth can-i "$@")"
+  decision="$(kubectl auth can-i "$@" 2>&1)" || true
   echo "rbac_${label}=${decision}"
 }
 
